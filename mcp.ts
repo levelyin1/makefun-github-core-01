@@ -1,0 +1,12 @@
+import {viewer} from './store.ts';
+const definitions={create_repo:['name','description','private'],get_repo:['owner','repo'],create_issue:['owner','repo','title','body'],list_issues:['owner','repo','state'],create_pull_request:['owner','repo','title','head','base','body'],merge_pull_request:['owner','repo','pull_number']};
+const required={create_repo:['name'],get_repo:['owner','repo'],create_issue:['owner','repo','title'],list_issues:['owner','repo'],create_pull_request:['owner','repo','title','head','base'],merge_pull_request:['owner','repo','pull_number']};
+const tools=Object.entries(definitions).map(([name,properties])=>({name,description:name.replaceAll('_',' ')+' in the shared forge store',inputSchema:{type:'object',properties:Object.fromEntries(properties.map(p=>[p,{type:p==='private'?'boolean':p==='pull_number'?'integer':'string'}])),required:required[name]}}));
+export function mcp(store,request){const {id,method,params={}}=request||{};const error=(code,message)=>({jsonrpc:'2.0',id:id??null,error:{code,message}});const result=value=>({jsonrpc:'2.0',id,result:value});
+ if(method==='server/discover'||method==='initialize')return result({serverInfo:{name:'original-forge',version:'1.0'},capabilities:{tools:{}},supportedVersions:['2026-07-28','2025-11-25'],protocolVersion:params.protocolVersion||'2026-07-28'});
+ if(method?.startsWith('notifications/'))return null;
+ if(method==='tools/list')return result({tools});
+ if(method!=='tools/call')return error(-32601,'Method not found');
+ const name=params.name,args=params.arguments;if(!definitions[name])return error(-32602,'Unknown tool');if(!args||required[name].some(k=>args[k]===undefined))return error(-32602,'Missing arguments');
+ try{let value;if(name==='create_repo')value=store.view(store.create(args));else{const r=store.repo(args.owner,args.repo);if(name==='get_repo')value=store.view(r);if(name==='create_issue')value=store.issue(r,args);if(name==='list_issues')value=r.issues.filter(i=>!args.state||args.state==='all'||i.state===args.state);if(name==='create_pull_request')value=store.pull(r,args);if(name==='merge_pull_request'){const p=r.pulls.find(p=>p.number===Number(args.pull_number));if(!p)throw Error('Pull not found');value=store.merge(r,p);}}return result({content:[{type:'text',text:JSON.stringify(value)}],structuredContent:typeof value==='object'&&!Array.isArray(value)?value:{items:value},isError:false});}catch(e){return result({content:[{type:'text',text:e.message}],isError:true});}
+}
