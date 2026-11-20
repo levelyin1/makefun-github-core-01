@@ -1,32 +1,170 @@
+// Satu proses HTTP yang menyatukan REST, GraphQL, MCP, dan Git smart HTTP.
 import {createServer} from 'node:http';
 import {pathToFileURL} from 'node:url';
-import {Store,Failure} from './store.ts';
-import {rest} from './rest.ts';
-import {graphql} from './graphql.ts';
-import {mcp} from './mcp.ts';
-import {git} from './git.ts';
-// Transcript authorship revision B
-export function createForge(token){const store=new Store();let seq=0;
- const server=createServer(async(req,res)=>{const headers={'Content-Type':'application/json','X-GitHub-Request-Id':String(++seq),'X-OAuth-Scopes':'repo, read:user'};
- const send=({status=200,body,raw,headers:extra={}})=>{const data=raw??Buffer.from(body===undefined?'':JSON.stringify(body));res.writeHead(status,{...headers,...extra,'Content-Length':data.length});res.end(data);};
- try{const url=new URL(req.url,'http://entry'),method=req.method;
-  if(url.pathname==='/healthz')return send({body:{ok:true}});
-  if(!token||req.headers.authorization!==`Bearer ${token}`)return send({status:401,body:{message:'Bad credentials'}});
-  const chunks=[];let size=0;for await(const part of req){size+=part.length;if(size>64*1024*1024)throw new Failure(413,'Body too large');chunks.push(part);}const raw=Buffer.concat(chunks);
-  const match=url.pathname.match(/^\/([^/]+)\/([^/]+)\.git\//);if(match){const r=store.repo(decodeURIComponent(match[1]),decodeURIComponent(match[2]));return send(git(store,r,method,url,req.headers,raw));}
-  let x={};if(raw.length){try{x=JSON.parse(raw.toString());}catch{if(url.pathname==='/mcp')return send({status:400,body:{jsonrpc:'2.0',id:null,error:{code:-32700,message:'Parse error'}}});throw new Failure(400,'Malformed JSON');}}
-  if(url.pathname==='/api/graphql')return send({body:graphql(store,x)});
-  if(url.pathname==='/mcp'){const body=mcp(store,x);return send(body===null?{status:202}:{body});}
-  if(url.pathname.startsWith('/api/v3'))return send(rest(store,method,url,x,`http://${req.headers.host}`));
-  throw new Failure(404,'Not Found');
- }catch(e){send({status:e.status||500,body:{message:e.status?e.message:'Internal error'}});}});
- return {server,store};
+import {Store, Failure} from './store.ts';
+import * as restModule from './rest.ts';
+import * as graphqlModule from './graphql.ts';
+import * as mcpModule from './mcp.ts';
+import * as gitModule from './git.ts';
+
+const rest = restModule.rest;
+const graphql = graphqlModule.graphql;
+const mcp = mcpModule.mcp;
+const git = gitModule.git;
+
+const MAX_BODY = 64 * 1024 * 1024;
+
+type Outcome = {
+  status?: number;
+  body?: unknown;
+  headers?: Record<string, string>;
+  raw?: Buffer;
+};
+
+function requestId() {
+  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
-const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function lifecycle(env=process.env){if(!env.MAKEFUN_ENV_URL)throw Error('MAKEFUN_ENV_URL required');const base=new URL(env.MAKEFUN_ENV_URL);if(!['http:','https:'].includes(base.protocol))throw Error('Invalid env origin');
- const {server}=createForge(env.MAKEFUN_SHOP_TOKEN);await new Promise(resolve=>server.listen(0,'0.0.0.0',resolve));const {port}=server.address();let registered=false;
- try{for(let i=0;i<6;i++){try{const r=await fetch(new URL('/register',base),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port}),signal:AbortSignal.timeout(1500)});if(r.ok){const value=await r.json();if(value.ok!==true)throw Error('Registration invalid');registered=true;break;}if(r.status>=400&&r.status<500)throw new Failure(r.status,'Registration refused');}catch(e){if(e instanceof Failure)throw e;}await sleep(Math.min(100*2**i,1000));}if(!registered)throw Error('Registration failed');
-  for(;;){try{const r=await fetch(new URL('/done',base),{signal:AbortSignal.timeout(1000)});if(r.ok&&(await r.json()).done===true)break;}catch{}await sleep(200);}
- }finally{await new Promise(resolve=>server.close(resolve));}
+
+async function collect(req, limit = MAX_BODY) {
+  const parts = [];
+  let total = 0;
+  for await (const part of req) {
+    const chunk = Buffer.from(part);
+    total += chunk.length;
+    if (total > limit) throw new Failure(413, 'Payload too large');
+    parts.push(chunk);
+  }
+  return Buffer.concat(parts);
 }
-if(import.meta.url===pathToFileURL(process.argv[1]||'').href)lifecycle().catch(e=>{console.error(e.message);process.exitCode=1;});
+
+async function jsonBody(req) {
+  const raw = await collect(req);
+  if (!raw.length) return {};
+  try {
+    return JSON.parse(raw.toString('utf8'));
+  } catch {
+    throw new Failure(400, 'Malformed JSON');
+  }
+}
+
+function reply(res, outcome = {}) {
+  const extra = outcome.headers || {};
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-GitHub-Request-Id': requestId(),
+    ...extra,
+  };
+  res.writeHead(outcome.status ?? 200, headers);
+  if (outcome.raw !== undefined) return res.end(outcome.raw);
+  if (outcome.body === undefined) return res.end();
+  res.end(JSON.stringify(outcome.body));
+}
+
+export function createForge(token) {
+  const store = new Store();
+  const originOf = (req) => 'http://' + (req.headers.host || '127.0.0.1');
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || '/', originOf(req));
+      const path = url.pathname;
+      if (path === '/healthz') {
+        reply(res, {body: {ok: true, status: 'up'}});
+        return;
+      }
+      if (req.headers.authorization !== 'Bearer ' + token) {
+        reply(res, {status: 401, body: {message: 'Unauthorized'}});
+        return;
+      }
+      const method = req.method || 'GET';
+      let outcome;
+      const gitPath = path.match(/^\/([^/]+)\/([^/]+)\.git(?:\/.*)?$/);
+      if (gitPath) {
+        const r = store.repo(decodeURIComponent(gitPath[1]), decodeURIComponent(gitPath[2]));
+        outcome = git(store, r, method, url, req.headers, await collect(req));
+      } else if (path === '/api/graphql') {
+        outcome = {body: graphql(store, await jsonBody(req))};
+      } else if (path === '/mcp') {
+        const rpc = mcp(store, await jsonBody(req));
+        outcome = {body: rpc === undefined ? null : rpc};
+      } else if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+        outcome = rest(store, method, url, await jsonBody(req), originOf(req));
+      } else {
+        outcome = {status: 404, body: {message: 'Not Found'}};
+      }
+      reply(res, outcome);
+    } catch (err) {
+      const status = err instanceof Failure ? err.status : 500;
+      const message = err instanceof Error ? err.message : String(err);
+      if (status >= 500) console.error(err);
+      reply(res, {status, body: {message}});
+    }
+  });
+  return {server, store};
+}
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export async function lifecycle(env = process.env) {
+  const base = env.MAKEFUN_ENV_URL;
+  if (!base) throw new Error('MAKEFUN_ENV_URL is required');
+  const token = env.MAKEFUN_SHOP_TOKEN || env.MAKEFUN_TOKEN || 'forge-token';
+  const deadline = Date.now() + (Number(env.MAKEFUN_LIFECYCLE_TIMEOUT) || 60_000);
+  const origin = String(base).replace(/\/+$/, '');
+  const {server} = createForge(token);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const address = server.address();
+    const port = address && typeof address === 'object' ? address.port : 0;
+    let attempt = 0;
+    for (;;) {
+      if (Date.now() > deadline) throw new Error('registration timed out');
+      try {
+        const response = await fetch(origin + '/register', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({port}),
+        });
+        if (!response.ok) throw new Error('register status ' + response.status);
+        await response.arrayBuffer();
+        break;
+      } catch (err) {
+        attempt += 1;
+        if (Date.now() > deadline) throw err;
+        await pause(Math.min(100 * 2 ** Math.min(attempt, 5), 2000));
+      }
+    }
+    let polls = 0;
+    for (;;) {
+      if (Date.now() > deadline) throw new Error('completion timed out');
+      const method = polls % 2 === 0 ? 'PUT' : 'GET';
+      polls += 1;
+      try {
+        const response = await fetch(origin + '/done', {
+          method,
+          headers: {'Content-Type': 'application/json'},
+          body: method === 'PUT' ? JSON.stringify({port}) : undefined,
+        });
+        if (!response.ok) throw new Error('done status ' + response.status);
+        const signal = JSON.parse(await response.text());
+        if (signal && signal.done === true) return {port, polls};
+      } catch {
+        // sementara: jaringan, status, atau JSON rusak tidak mengakhiri sesi; lanjut polling.
+      }
+      await pause(120);
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+const entry = process.argv[1];
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+  lifecycle().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exitCode = 1;
+  });
+}
