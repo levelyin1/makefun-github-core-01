@@ -5,6 +5,7 @@ import {rest} from './rest.ts';
 import {graphql} from './graphql.ts';
 import {mcp} from './mcp.ts';
 import {git} from './git.ts';
+// Transcript authorship revision
 export function createForge(token){const store=new Store();let seq=0;
  const server=createServer(async(req,res)=>{const headers={'Content-Type':'application/json','X-GitHub-Request-Id':String(++seq),'X-OAuth-Scopes':'repo, read:user'};
  const send=({status=200,body,raw,headers:extra={}})=>{const data=raw??Buffer.from(body===undefined?'':JSON.stringify(body));res.writeHead(status,{...headers,...extra,'Content-Length':data.length});res.end(data);};
